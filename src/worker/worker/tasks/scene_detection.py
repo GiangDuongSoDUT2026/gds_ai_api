@@ -5,7 +5,8 @@ import cv2
 import structlog
 
 from worker.app import app
-from worker.utils.db import get_sync_session, update_lecture_status_sync
+from worker.utils.db import get_sync_session, update_lecture_status_sync, increment_retry_count
+from worker.utils.retry import classify_error, get_retry_params, is_retryable
 
 logger = structlog.get_logger(__name__)
 
@@ -13,8 +14,8 @@ logger = structlog.get_logger(__name__)
 @app.task(bind=True, queue="gpu.high", max_retries=3, default_retry_delay=60)
 def detect_scenes(self, lecture_id: str, video_tmp_path: str) -> dict:
     from shared.database.models import Scene, VideoStatus
+    from shared.config import get_settings
     from worker.models.loader import get_transnetv2
-    from worker.utils.storage import upload_file
     from worker.utils.video import extract_frame
 
     log = logger.bind(lecture_id=lecture_id, task_id=self.request.id)
@@ -25,7 +26,6 @@ def detect_scenes(self, lecture_id: str, video_tmp_path: str) -> dict:
 
         model = get_transnetv2()
         scenes_data = model.detect_scenes(video_tmp_path, threshold=0.01)
-
         log.info("scenes_detected", count=len(scenes_data))
 
         video_path = Path(video_tmp_path)
@@ -34,12 +34,7 @@ def detect_scenes(self, lecture_id: str, video_tmp_path: str) -> dict:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
 
-        from shared.config import get_settings
-
         settings = get_settings()
-        tmp_frames_dir = Path("/tmp/gds_worker") / f"frames_{lecture_id}"
-        tmp_frames_dir.mkdir(parents=True, exist_ok=True)
-
         scene_ids: list[str] = []
         keyframe_paths: list[str] = []
 
@@ -48,22 +43,23 @@ def detect_scenes(self, lecture_id: str, video_tmp_path: str) -> dict:
                 shot_idx = scene_info["shot_index"]
                 frame_start = scene_info["frame_start"]
                 frame_end = scene_info["frame_end"]
-
                 keyframe_frame_idx = (frame_start + frame_end) // 2
 
                 frame = extract_frame(video_path, keyframe_frame_idx)
 
                 minio_key: str | None = None
-                local_frame_path: Path | None = None
+                frame_dest_path: Path | None = None
 
                 if frame is not None:
                     import cv2 as _cv2
 
-                    local_frame_path = tmp_frames_dir / f"shot_{shot_idx:04d}.jpg"
-                    _cv2.imwrite(str(local_frame_path), frame)
-
-                    minio_key = f"{lecture_id}/shot_{shot_idx:04d}.jpg"
-                    upload_file(local_frame_path, settings.minio_bucket_frames, minio_key)
+                    frame_key = f"{lecture_id}/shot_{shot_idx:04d}.jpg"
+                    frame_dest_path = (
+                        Path(settings.storage_path) / settings.storage_bucket_frames / frame_key
+                    )
+                    frame_dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    _cv2.imwrite(str(frame_dest_path), frame)
+                    minio_key = frame_key
 
                 scene = Scene(
                     id=uuid.uuid4(),
@@ -79,8 +75,8 @@ def detect_scenes(self, lecture_id: str, video_tmp_path: str) -> dict:
                 session.flush()
 
                 scene_ids.append(str(scene.id))
-                if local_frame_path:
-                    keyframe_paths.append(str(local_frame_path))
+                if frame_dest_path:
+                    keyframe_paths.append(str(frame_dest_path))
 
             from sqlalchemy import update as sa_update
             from shared.database.models import LectureVideo
@@ -101,6 +97,17 @@ def detect_scenes(self, lecture_id: str, video_tmp_path: str) -> dict:
         }
 
     except Exception as exc:
-        log.error("scene_detection_failed", error=str(exc))
-        update_lecture_status_sync(lecture_id, VideoStatus.FAILED, error_message=str(exc))
-        raise self.retry(exc=exc)
+        error_code = classify_error(exc)
+        log.error("scene_detection_failed", error=str(exc), error_code=error_code.value)
+        update_lecture_status_sync(
+            lecture_id, VideoStatus.FAILED,
+            error_message=str(exc), error_code=error_code.value,
+        )
+        if not is_retryable(error_code):
+            return {"lecture_id": lecture_id, "status": "FAILED", "error_code": error_code.value}
+
+        increment_retry_count(lecture_id)
+        params = get_retry_params(error_code)
+        if self.request.retries >= params["max_retries"]:
+            return {"lecture_id": lecture_id, "status": "FAILED", "error_code": error_code.value}
+        raise self.retry(exc=exc, countdown=params["countdown"])

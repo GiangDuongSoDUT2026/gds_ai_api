@@ -44,13 +44,10 @@ class Settings(BaseSettings):
             f"@{self.rabbitmq_host}:{self.rabbitmq_port}/{vhost}"
         )
 
-    minio_endpoint: str = "localhost:9000"
-    minio_access_key: str = "minioadmin"
-    minio_secret_key: str = "minioadmin"
-    minio_bucket_videos: str = "videos"
-    minio_bucket_frames: str = "frames"
-    minio_use_ssl: bool = False
-    minio_public_url: str = "http://localhost:9000"
+    storage_path: str = "./data"
+    storage_bucket_videos: str = "videos"
+    storage_bucket_frames: str = "frames"
+    storage_base_url: str = "http://localhost:8000/files"
 
     log_level: str = "INFO"
     environment: str = "development"

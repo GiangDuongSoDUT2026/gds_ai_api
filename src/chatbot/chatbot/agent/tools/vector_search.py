@@ -100,7 +100,7 @@ class VectorSearchTool(BaseTool):
                 keyframe_url = None
                 if row["keyframe_minio_key"]:
                     keyframe_url = (
-                        f"{settings.minio_public_url}/{settings.minio_bucket_frames}/{row['keyframe_minio_key']}"
+                        f"{settings.storage_base_url}/{settings.storage_bucket_frames}/{row['keyframe_minio_key']}"
                     )
 
                 results.append(

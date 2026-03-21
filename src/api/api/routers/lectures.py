@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from api.dependencies import get_db, get_minio
+from api.dependencies import get_db
 from api.dependencies.auth import require_teacher
 from api.schemas.lecture import LectureResponse, LectureUpdate, SceneResponse
 from shared.database.models import LectureVideo, Scene, User, UserRole
@@ -17,25 +17,17 @@ router = APIRouter(prefix="/lectures", tags=["lectures"])
 logger = structlog.get_logger(__name__)
 
 
-def _build_presigned_url(bucket: str, key: str | None, minio) -> str | None:
+def _build_file_url(bucket: str, key: str | None) -> str | None:
     if not key:
         return None
     settings = get_settings()
-    try:
-        return minio.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": bucket, "Key": key},
-            ExpiresIn=3600,
-        )
-    except Exception:
-        return f"{settings.minio_public_url}/{bucket}/{key}"
+    return f"{settings.storage_base_url}/{bucket}/{key}"
 
 
 @router.get("/{lecture_id}", response_model=LectureResponse)
 async def get_lecture(
     lecture_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    minio=Depends(get_minio),
 ) -> LectureResponse:
     result = await db.execute(
         select(LectureVideo)
@@ -56,7 +48,7 @@ async def get_lecture(
             transcript=scene.transcript,
             ocr_text=scene.ocr_text,
             visual_tags=scene.visual_tags,
-            keyframe_url=_build_presigned_url(get_settings().minio_bucket_frames, scene.keyframe_minio_key, minio),
+            keyframe_url=_build_file_url(get_settings().storage_bucket_frames, scene.keyframe_minio_key),
         )
         for scene in scenes
     ]
@@ -68,7 +60,7 @@ async def get_lecture(
         fps=lecture.fps,
         duration_sec=lecture.duration_sec,
         scenes=scene_responses,
-        video_url=_build_presigned_url(get_settings().minio_bucket_videos, lecture.minio_key, minio),
+        video_url=_build_file_url(get_settings().storage_bucket_videos, lecture.minio_key),
         created_at=lecture.created_at,
     )
 
@@ -78,7 +70,6 @@ async def list_lectures(
     chapter_id: Optional[uuid.UUID] = Query(None),
     limit: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db),
-    minio=Depends(get_minio),
 ) -> list[LectureResponse]:
     query = select(LectureVideo).options(selectinload(LectureVideo.scenes))
     if chapter_id:
@@ -102,7 +93,7 @@ async def list_lectures(
                 transcript=scene.transcript,
                 ocr_text=scene.ocr_text,
                 visual_tags=scene.visual_tags,
-                keyframe_url=_build_presigned_url(get_settings().minio_bucket_frames, scene.keyframe_minio_key, minio),
+                keyframe_url=_build_file_url(get_settings().storage_bucket_frames, scene.keyframe_minio_key),
             )
             for scene in scenes
         ]
@@ -114,7 +105,7 @@ async def list_lectures(
                 fps=lecture.fps,
                 duration_sec=lecture.duration_sec,
                 scenes=scene_responses,
-                video_url=_build_presigned_url(get_settings().minio_bucket_videos, lecture.minio_key, minio),
+                video_url=_build_file_url(get_settings().storage_bucket_videos, lecture.minio_key),
                 created_at=lecture.created_at,
             )
         )
@@ -127,7 +118,6 @@ async def update_lecture(
     body: LectureUpdate,
     current_user: Annotated[User, Depends(require_teacher)],
     db: AsyncSession = Depends(get_db),
-    minio=Depends(get_minio),
 ) -> LectureResponse:
     result = await db.execute(
         select(LectureVideo).options(selectinload(LectureVideo.scenes)).where(LectureVideo.id == lecture_id)
@@ -153,7 +143,7 @@ async def update_lecture(
             transcript=scene.transcript,
             ocr_text=scene.ocr_text,
             visual_tags=scene.visual_tags,
-            keyframe_url=_build_presigned_url(get_settings().minio_bucket_frames, scene.keyframe_minio_key, minio),
+            keyframe_url=_build_file_url(get_settings().storage_bucket_frames, scene.keyframe_minio_key),
         )
         for scene in scenes
     ]
@@ -164,7 +154,7 @@ async def update_lecture(
         fps=lecture.fps,
         duration_sec=lecture.duration_sec,
         scenes=scene_responses,
-        video_url=_build_presigned_url(get_settings().minio_bucket_videos, lecture.minio_key, minio),
+        video_url=_build_file_url(get_settings().storage_bucket_videos, lecture.minio_key),
         created_at=lecture.created_at,
     )
 

@@ -10,7 +10,6 @@ dependencies = [
     "easyocr>=1.7",
     "open-clip-torch>=2.24",
     "sentence-transformers>=3.0",
-    "boto3>=1.34",
     "opencv-python-headless>=4.9",
     "ffmpeg-python>=0.2",
     "numpy>=1.26",

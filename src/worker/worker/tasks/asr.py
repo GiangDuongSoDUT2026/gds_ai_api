@@ -3,7 +3,8 @@ from pathlib import Path
 import structlog
 
 from worker.app import app
-from worker.utils.db import update_lecture_status_sync
+from worker.utils.db import update_lecture_status_sync, increment_retry_count
+from worker.utils.retry import classify_error, get_retry_params, is_retryable
 
 logger = structlog.get_logger(__name__)
 
@@ -33,11 +34,20 @@ def run_asr(self, lecture_id: str, video_tmp_path: str) -> dict:
             audio_path.unlink()
 
         log.info("asr_completed", segment_count=len(segments))
-        return {
-            "lecture_id": lecture_id,
-            "segments": segments,
-        }
+        return {"lecture_id": lecture_id, "segments": segments}
 
     except Exception as exc:
-        log.error("asr_failed", error=str(exc))
-        raise self.retry(exc=exc)
+        error_code = classify_error(exc)
+        log.error("asr_failed", error=str(exc), error_code=error_code.value)
+        update_lecture_status_sync(
+            lecture_id, VideoStatus.FAILED,
+            error_message=str(exc), error_code=error_code.value,
+        )
+        if not is_retryable(error_code):
+            return {"lecture_id": lecture_id, "status": "FAILED", "error_code": error_code.value}
+
+        increment_retry_count(lecture_id)
+        params = get_retry_params(error_code)
+        if self.request.retries >= params["max_retries"]:
+            return {"lecture_id": lecture_id, "status": "FAILED", "error_code": error_code.value}
+        raise self.retry(exc=exc, countdown=params["countdown"])

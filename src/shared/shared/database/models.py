@@ -89,13 +89,11 @@ class User(Base):
     )
     faculty = Column(String(255), nullable=True)
 
-    # Student fields
-    student_code = Column(String(50), nullable=True)   # mã sinh viên
-    major = Column(String(255), nullable=True)          # ngành học
+    student_code = Column(String(50), nullable=True)
+    major = Column(String(255), nullable=True)
 
-    # Teacher fields
-    teacher_code = Column(String(50), nullable=True)    # mã giảng viên
-    department = Column(String(255), nullable=True)     # bộ môn
+    teacher_code = Column(String(50), nullable=True)
+    department = Column(String(255), nullable=True)
 
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -209,8 +207,8 @@ class LectureVideo(Base):
     )
     title = Column(String(500), nullable=False)
     minio_key = Column(String(1000), nullable=False)
-    video_hash = Column(String(64), nullable=True, index=True)   # SHA256 for duplicate detection
-    file_size_bytes = Column(Integer, nullable=True)              # original file size
+    video_hash = Column(String(64), nullable=True, index=True)
+    file_size_bytes = Column(Integer, nullable=True)
     status = Column(
         Enum(VideoStatus, name="video_status_enum"),
         nullable=False,
@@ -218,11 +216,18 @@ class LectureVideo(Base):
     )
     fps = Column(Float)
     duration_sec = Column(Float)
-    frame_count = Column(BigInteger)
+    frame_count = Column(BigInteger)       # tổng số frame của video (fps × duration)
+    scene_count = Column(Integer)          # số scene detect được
     uploaded_by = Column(String(255))
     owner_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     error_message = Column(Text)
+    # plain VARCHAR — dùng constants từ shared.constants.errors.ProcessingErrorCode
+    error_code = Column(String(50), nullable=True)
+    retry_count = Column(Integer, nullable=False, default=0)
     celery_task_id = Column(String(255))
+    processing_started_at = Column(DateTime(timezone=True), nullable=True)
+    processing_ended_at = Column(DateTime(timezone=True), nullable=True)
+    processing_duration_sec = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     processed_at = Column(DateTime(timezone=True))
     updated_at = Column(
@@ -231,6 +236,9 @@ class LectureVideo(Base):
 
     chapter = relationship("Chapter", back_populates="lectures")
     scenes = relationship("Scene", back_populates="lecture", cascade="all, delete-orphan")
+    transcript_chunks = relationship(
+        "TranscriptChunk", back_populates="lecture", cascade="all, delete-orphan"
+    )
     owner = relationship("User", back_populates="owned_lectures")
 
     __table_args__ = (
@@ -258,7 +266,11 @@ class Scene(Base):
     transcript = Column(Text)
     ocr_text = Column(Text)
     visual_tags = Column(ARRAY(String))
+    # legacy combined FTS (backward compat)
     fts_vector = Column(TSVECTOR)
+    # split FTS — transcript và OCR riêng để query độc lập
+    transcript_fts = Column(TSVECTOR)
+    ocr_fts = Column(TSVECTOR)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -272,7 +284,44 @@ class Scene(Base):
     __table_args__ = (
         Index("ix_scenes_lecture_id", "lecture_id"),
         Index("ix_scenes_fts_vector", "fts_vector", postgresql_using="gin"),
+        Index("ix_scenes_transcript_fts", "transcript_fts", postgresql_using="gin"),
+        Index("ix_scenes_ocr_fts", "ocr_fts", postgresql_using="gin"),
         Index("ix_scenes_lecture_shot", "lecture_id", "shot_index", unique=True),
+    )
+
+
+# ─── TranscriptChunk ──────────────────────────────────────────────────────────
+
+
+class TranscriptChunk(Base):
+    """
+    Semantic transcript segment — cắt theo khoảng im lặng + overlap,
+    không bị hard-cut theo scene boundary.
+    """
+    __tablename__ = "transcript_chunks"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    lecture_id = Column(
+        UUID(as_uuid=True), ForeignKey("lecture_videos.id", ondelete="CASCADE"), nullable=False
+    )
+    chunk_index = Column(Integer, nullable=False)
+    text = Column(Text, nullable=False)
+    start_sec = Column(Float, nullable=False)
+    end_sec = Column(Float, nullable=False)
+    overlap_prev_sec = Column(Float, nullable=False, default=0.0)
+    overlap_next_sec = Column(Float, nullable=False, default=0.0)
+    # scene nào overlap với chunk này
+    scene_ids = Column(ARRAY(UUID(as_uuid=True)), nullable=False, default=list)
+    text_embedding = Column(Vector(1024))
+    fts_vector = Column(TSVECTOR)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    lecture = relationship("LectureVideo", back_populates="transcript_chunks")
+
+    __table_args__ = (
+        Index("ix_transcript_chunks_lecture_id", "lecture_id"),
+        Index("ix_transcript_chunks_lecture_idx", "lecture_id", "chunk_index", unique=True),
+        Index("ix_transcript_chunks_fts", "fts_vector", postgresql_using="gin"),
     )
 
 
@@ -286,8 +335,8 @@ class SceneEmbedding(Base):
     scene_id = Column(
         UUID(as_uuid=True), ForeignKey("scenes.id", ondelete="CASCADE"), nullable=False, unique=True
     )
-    image_embedding = Column(Vector(768))
-    text_embedding = Column(Vector(1024))
+    image_embedding = Column(Vector(768))   # CLIP ViT-L/14 — visual search
+    text_embedding = Column(Vector(1024))   # multilingual-e5-large — text search
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -362,7 +411,7 @@ class ChatSession(Base):
         "ChatMessage",
         back_populates="session",
         cascade="all, delete-orphan",
-        order_by="ChatMessage.created_at",
+        order_by="ChatMessage.sequence_num",
     )
 
     __table_args__ = (
@@ -383,13 +432,21 @@ class ChatMessage(Base):
     )
     role = Column(Enum(ChatRole, name="chat_role_enum"), nullable=False)
     content = Column(Text, nullable=False)
-    tool_calls = Column(JSONB)
-    citations = Column(JSONB)
+    sequence_num = Column(Integer, nullable=False, default=0)
+    # plain VARCHAR — dùng constants từ shared.constants.messages.MessageStatus
+    status = Column(String(20), nullable=False, default="DONE")
+    duration_ms = Column(Integer, nullable=True)
+    # Flexible JSONB — chứa agent_steps, citations, tool results
+    # Schema: {"agent_steps": [...], "citations": [...]}
+    metadata = Column(JSONB, nullable=False, default=dict)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     session = relationship("ChatSession", back_populates="messages")
 
-    __table_args__ = (Index("ix_chat_messages_session_id", "session_id"),)
+    __table_args__ = (
+        Index("ix_chat_messages_session_id", "session_id"),
+        Index("ix_chat_messages_session_seq", "session_id", "sequence_num"),
+    )
 
 
 # ─── UploadBatch ──────────────────────────────────────────────────────────────
@@ -398,7 +455,7 @@ class ChatMessage(Base):
 class BatchStatus(str, enum.Enum):
     PROCESSING = "PROCESSING"
     COMPLETED = "COMPLETED"
-    PARTIAL = "PARTIAL"  # some failed
+    PARTIAL = "PARTIAL"
 
 
 class UploadBatch(Base):
@@ -414,9 +471,12 @@ class UploadBatch(Base):
     total = Column(Integer, nullable=False, default=0)
     succeeded = Column(Integer, nullable=False, default=0)
     failed = Column(Integer, nullable=False, default=0)
+    processing_started_at = Column(DateTime(timezone=True), nullable=True)
+    processing_completed_at = Column(DateTime(timezone=True), nullable=True)
+    total_processing_sec = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    # items stored as JSONB: [{lecture_id, task_id, filename, status}]
+    # items: [{lecture_id, task_id, filename, status, started_at, ended_at, processing_sec, scene_count, error_code}]
     items = Column(JSONB, nullable=False, default=list)
 
 
@@ -424,7 +484,6 @@ class UploadBatch(Base):
 
 
 class StudentVideoProgress(Base):
-    """Tracks per-student per-lecture watch progress."""
     __tablename__ = "student_video_progress"
     __table_args__ = (UniqueConstraint("student_id", "lecture_id", name="uq_student_lecture_progress"),)
 
@@ -433,8 +492,8 @@ class StudentVideoProgress(Base):
     lecture_id = Column(UUID(as_uuid=True), ForeignKey("lecture_videos.id", ondelete="CASCADE"), nullable=False)
     watched_seconds = Column(Float, nullable=False, default=0.0)
     completed = Column(Boolean, nullable=False, default=False)
-    last_position_sec = Column(Float, nullable=False, default=0.0)   # resume point
-    scenes_viewed = Column(JSONB, nullable=False, default=list)       # [scene_id, ...]
+    last_position_sec = Column(Float, nullable=False, default=0.0)
+    scenes_viewed = Column(JSONB, nullable=False, default=list)
     last_watched_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -443,15 +502,14 @@ class StudentVideoProgress(Base):
 
 
 class StudentLearningEvent(Base):
-    """Fine-grained events: scene viewed, search performed, chat asked."""
     __tablename__ = "student_learning_events"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     student_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    event_type = Column(String(50), nullable=False)   # "watch", "scene_view", "search", "chat"
+    event_type = Column(String(50), nullable=False)
     lecture_id = Column(UUID(as_uuid=True), ForeignKey("lecture_videos.id", ondelete="SET NULL"), nullable=True)
     scene_id = Column(UUID(as_uuid=True), ForeignKey("scenes.id", ondelete="SET NULL"), nullable=True)
-    payload = Column(JSONB, nullable=True)    # e.g. {"query": "...", "position_sec": 120}
+    payload = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     student = relationship("User", foreign_keys=[student_id])

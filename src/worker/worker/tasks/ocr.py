@@ -3,6 +3,7 @@ from pathlib import Path
 import structlog
 
 from worker.app import app
+from worker.utils.retry import classify_error, get_retry_params, is_retryable
 
 logger = structlog.get_logger(__name__)
 
@@ -23,7 +24,6 @@ def run_ocr(self, scene_ids: list[str], keyframe_paths: list[str]) -> dict:
             if not path.exists():
                 ocr_results[scene_id] = ""
                 continue
-
             text = ocr_model.extract_text(path)
             ocr_results[scene_id] = text
 
@@ -31,5 +31,12 @@ def run_ocr(self, scene_ids: list[str], keyframe_paths: list[str]) -> dict:
         return {"ocr_results": ocr_results}
 
     except Exception as exc:
-        log.error("ocr_failed", error=str(exc))
-        raise self.retry(exc=exc)
+        error_code = classify_error(exc)
+        log.error("ocr_failed", error=str(exc), error_code=error_code.value)
+        if not is_retryable(error_code):
+            return {"ocr_results": {}}
+
+        params = get_retry_params(error_code)
+        if self.request.retries >= params["max_retries"]:
+            return {"ocr_results": {}}
+        raise self.retry(exc=exc, countdown=params["countdown"])

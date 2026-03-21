@@ -122,32 +122,44 @@ async def chat_with_history(
     result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.created_at)
+        .order_by(ChatMessage.sequence_num)
     )
     existing_messages = result.scalars().all()
     history = [{"role": msg.role.value, "content": msg.content} for msg in existing_messages]
+    next_seq = len(existing_messages)
 
     user_msg = ChatMessage(
         id=uuid.uuid4(),
         session_id=session_id,
         role=ChatRole.user,
         content=request.content,
+        sequence_num=next_seq,
+        status="DONE",
     )
     db.add(user_msg)
     await db.flush()
 
+    import time
+    t0 = time.monotonic()
     agent = LectureAgent(user_context=user_ctx)
     response = await agent.chat(request.content, history)
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    metadata: dict = {}
+    if response.tool_calls_used:
+        metadata["agent_steps"] = [{"tool": t, "status": "done"} for t in response.tool_calls_used]
+    if response.citations:
+        metadata["citations"] = [c.model_dump() for c in response.citations]
 
     assistant_msg = ChatMessage(
         id=uuid.uuid4(),
         session_id=session_id,
         role=ChatRole.assistant,
         content=response.content,
-        citations=[c.model_dump() for c in response.citations] if response.citations else None,
-        tool_calls=[{"tool": t} for t in response.tool_calls_used]
-        if response.tool_calls_used
-        else None,
+        sequence_num=next_seq + 1,
+        status="DONE",
+        duration_ms=duration_ms,
+        metadata=metadata,
     )
     db.add(assistant_msg)
     await db.commit()

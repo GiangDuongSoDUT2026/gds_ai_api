@@ -9,7 +9,7 @@ from sqlalchemy import select, desc
 from sqlalchemy import select as sa_select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.dependencies import get_db, get_minio, get_celery
+from api.dependencies import get_db, get_celery
 from api.dependencies.auth import require_teacher
 from shared.config import get_settings
 from shared.database.models import LectureVideo, VideoStatus, UploadBatch, BatchStatus, User
@@ -101,7 +101,6 @@ async def _upload_one(
     title: str,
     current_user: User,
     db: AsyncSession,
-    minio,
     celery_app,
 ) -> dict:
     settings = get_settings()
@@ -113,18 +112,16 @@ async def _upload_one(
         return {"filename": filename, "status": "REJECTED", **err}
 
     lecture_id = uuid.uuid4()
-    ext = Path(filename).suffix.lower() or ".mp4"
     minio_key = f"{lecture_id}/{filename}"
 
     try:
-        minio.upload_fileobj(
-            file.file,
-            settings.minio_bucket_videos,
-            minio_key,
-            ExtraArgs={"ContentType": file.content_type or "video/mp4"},
-        )
+        dest = Path(settings.storage_path) / settings.storage_bucket_videos / str(lecture_id)
+        dest.mkdir(parents=True, exist_ok=True)
+        dest_file = dest / filename
+        contents = await file.read()
+        dest_file.write_bytes(contents)
     except Exception as e:
-        logger.error("minio_upload_failed", filename=filename, error=str(e))
+        logger.error("storage_write_failed", filename=filename, error=str(e))
         return {"filename": filename, "status": "FAILED", "error": f"Lỗi lưu trữ: {str(e)}", "code": "STORAGE_ERROR"}
 
     lecture = LectureVideo(
@@ -166,11 +163,10 @@ async def upload_video(
     uploaded_by: str = Form(None),
     current_user: Annotated[User, Depends(require_teacher)] = None,
     db: AsyncSession = Depends(get_db),
-    minio=Depends(get_minio),
     celery_app=Depends(get_celery),
 ):
     """Single video upload — returns {lecture_id, task_id, status, message, eta_minutes}."""
-    result = await _upload_one(file, chapter_id, title, current_user, db, minio, celery_app)
+    result = await _upload_one(file, chapter_id, title, current_user, db, celery_app)
     if result.get("status") in ("FAILED", "REJECTED"):
         raise HTTPException(400, result.get("error"))
     await db.commit()
@@ -189,7 +185,6 @@ async def upload_videos_bulk(
     chapter_id: uuid.UUID = Form(...),
     current_user: Annotated[User, Depends(require_teacher)] = None,
     db: AsyncSession = Depends(get_db),
-    minio=Depends(get_minio),
     celery_app=Depends(get_celery),
 ):
     """Bulk video upload — returns {batch_id, total, accepted, rejected, items[], eta_minutes}."""
@@ -211,7 +206,7 @@ async def upload_videos_bulk(
     items = []
     for file in files:
         title = file.filename or "Untitled"
-        item = await _upload_one(file, chapter_id, title, current_user, db, minio, celery_app)
+        item = await _upload_one(file, chapter_id, title, current_user, db, celery_app)
         item["batch_id"] = str(batch.id)
         items.append(item)
 
@@ -240,7 +235,6 @@ async def chat_upload(
     chapter_id: uuid.UUID = Form(...),
     current_user: Annotated[User, Depends(require_teacher)] = None,
     db: AsyncSession = Depends(get_db),
-    minio=Depends(get_minio),
     celery_app=Depends(get_celery),
 ):
     """
@@ -264,7 +258,7 @@ async def chat_upload(
 
     items = []
     for file in files:
-        item = await _upload_one(file, chapter_id, file.filename or "", current_user, db, minio, celery_app)
+        item = await _upload_one(file, chapter_id, file.filename or "", current_user, db, celery_app)
         item["batch_id"] = str(batch.id)
         items.append(item)
 

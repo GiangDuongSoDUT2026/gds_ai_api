@@ -1,6 +1,9 @@
+from pathlib import Path
+
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from shared.logging import setup_logging
 
@@ -28,6 +31,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+storage_dir = Path(settings.storage_path)
+storage_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/files", StaticFiles(directory=str(storage_dir)), name="files")
 
 app.include_router(upload.router, prefix="/api/v1")
 app.include_router(jobs.router, prefix="/api/v1")
