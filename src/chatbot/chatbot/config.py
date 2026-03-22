@@ -12,10 +12,11 @@ class ChatbotSettings(Settings):
     llm_provider: str = "openai"
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o"
+    openai_base_url: str | None = None  # override endpoint (e.g. Google AI Studio)
     vllm_base_url: str | None = None
     vllm_model: str | None = None
     max_tool_iterations: int = 5
-    secret_key: str = "change-me-in-production"  # same as API secret_key
+    api_secret_key: str = "change-me-in-production"
 
     # FalkorDB (Graph Database for GraphRAG)
     falkordb_host: str = "falkordb"

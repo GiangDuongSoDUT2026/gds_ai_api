@@ -8,7 +8,7 @@ def decode_user_context(token: str | None) -> dict | None:
         return None
     try:
         settings = get_settings()
-        payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+        payload = jwt.decode(token, settings.api_secret_key, algorithms=["HS256"])
         if payload.get("type") != "access":
             return None
         return {

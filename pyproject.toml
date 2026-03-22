@@ -1,11 +1,96 @@
-[tool.uv.workspace]
-members = ["src/*"]
-
-[tool.uv]
-dev-dependencies = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-    "httpx>=0.27",
-    "pytest-mock>=3.14",
-    "ruff>=0.4",
+[tool.poetry]
+name = "gds-ai-api"
+version = "0.1.0"
+description = "GDS AI API — lecture processing and semantic search platform"
+authors = []
+readme = "README.md"
+packages = [
+    { include = "shared",  from = "src/shared" },
+    { include = "api",     from = "src/api" },
+    { include = "worker",  from = "src/worker" },
+    { include = "chatbot", from = "src/chatbot" },
 ]
+
+# ── Core dependencies (shared + api + migrations) ─────────────────────────────
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+
+# DB / ORM
+sqlalchemy = { version = ">=2.0.30", extras = ["asyncio"] }
+greenlet = ">=3.0"
+asyncpg = ">=0.29"
+psycopg2-binary = ">=2.9"
+pgvector = ">=0.3.2"
+alembic = ">=1.13"
+python-dotenv = ">=1.0"
+
+# Config / validation
+pydantic = { version = ">=2.7", extras = ["email"] }
+pydantic-settings = ">=2.3"
+
+# API
+fastapi = ">=0.115"
+uvicorn = { version = ">=0.30", extras = ["standard"] }
+python-multipart = ">=0.0.9"
+python-jose = { version = ">=3.3", extras = ["cryptography"] }
+passlib = { version = ">=1.7", extras = ["bcrypt"] }
+bcrypt = ">=3.0,<4.0"
+
+# Task queue
+celery = { version = ">=5.3", extras = ["rabbitmq"] }
+
+# Utils
+structlog = ">=24.1"
+httpx = ">=0.27"
+numpy = ">=1.26"
+
+# ── Search/ML group (semantic search — cài khi cần hybrid search) ────────────
+[tool.poetry.group.search]
+optional = true
+
+[tool.poetry.group.search.dependencies]
+sentence-transformers = ">=3.0"
+open-clip-torch = ">=2.24"
+
+# ── Worker group (GPU / video processing — cài khi có GPU) ───────────────────
+[tool.poetry.group.worker]
+optional = true
+
+[tool.poetry.group.worker.dependencies]
+tensorflow = ">=2.15"
+faster-whisper = ">=1.0"
+easyocr = ">=1.7"
+opencv-python-headless = ">=4.9"
+ffmpeg-python = ">=0.2"
+
+# ── Chatbot group (LangGraph / LLM) ──────────────────────────────────────────
+[tool.poetry.group.chatbot]
+optional = true
+
+[tool.poetry.group.chatbot.dependencies]
+langchain = ">=0.2"
+langchain-openai = ">=0.1"
+langchain-core = ">=0.2"
+langgraph = ">=0.2"
+litellm = ">=1.40"
+falkordb = ">=1.0"
+websockets = ">=12.0"
+
+# ── Dev ───────────────────────────────────────────────────────────────────────
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+pytest-asyncio = ">=0.23"
+pytest-mock = ">=3.14"
+ruff = ">=0.4"
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

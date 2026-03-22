@@ -1,21 +1,21 @@
 from __future__ import annotations
 
 import threading
-from typing import Any
+from typing import Any, Optional
 
 import structlog
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.dependencies import get_db
-from api.schemas.search import SearchRequest, SearchResponse, VideoSearchResult, SceneSnippet
+from api.schemas.search import SearchResponse, SearchResult
 from shared.config import get_settings
 
 router = APIRouter(prefix="/search", tags=["search"])
 logger = structlog.get_logger(__name__)
 
-# ── Singleton models ───────────────────────────────────────────────────────────
+# ── Singleton ML models (loaded lazily, only in semantic mode) ─────────────────
 
 _e5_model = None
 _e5_lock = threading.Lock()
@@ -50,8 +50,7 @@ def _get_clip():
 
 
 def _encode_e5(query: str) -> str:
-    embedder = _get_e5()
-    vec = embedder.encode(f"query: {query}", normalize_embeddings=True).tolist()
+    vec = _get_e5().encode(f"query: {query}", normalize_embeddings=True).tolist()
     return "[" + ",".join(str(v) for v in vec) + "]"
 
 
@@ -62,53 +61,100 @@ def _encode_clip(query: str) -> str:
         tokens = tokenizer([query])
         features = model.encode_text(tokens)
         features = features / features.norm(dim=-1, keepdim=True)
-    vec = features[0].tolist()
-    return "[" + ",".join(str(v) for v in vec) + "]"
+    return "[" + ",".join(str(v) for v in features[0].tolist()) + "]"
 
 
-# ── Main endpoint ──────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-@router.get("/", response_model=SearchResponse)
-async def search(
-    request: SearchRequest = Depends(),
-    db: AsyncSession = Depends(get_db),
-) -> SearchResponse:
-    logger.info("search_requested", query=request.q, n_videos=request.n_videos)
+def _keyframe_url(key: str | None) -> str | None:
+    if not key:
+        return None
     settings = get_settings()
+    return f"{settings.storage_base_url}/{settings.storage_bucket_frames}/{key}"
 
-    text_vec  = _encode_e5(request.q)
-    clip_vec  = _encode_clip(request.q)
 
-    course_filter = "AND co.id = :course_id" if request.course_id else ""
-    params: dict[str, Any] = {
-        "q":           request.q,
-        "text_vec":    text_vec,
-        "clip_vec":    clip_vec,
-        "k":           request.candidate_k,
-        "n_videos":    request.n_videos,
-    }
-    if request.course_id:
-        params["course_id"] = request.course_id
+# ── Keyword-only FTS search ────────────────────────────────────────────────────
 
+async def _keyword_search(
+    db: AsyncSession, q: str, course_id: Any, limit: int, offset: int
+) -> list[SearchResult]:
+    course_filter = "AND co.id = :course_id" if course_id else ""
     sql = text(f"""
-    WITH
-    -- ── Arm 1: Keyword FTS (transcript_fts weight A, ocr_fts weight B) ─────
-    kw AS (
         SELECT
-            s.id          AS scene_id,
-            s.lecture_id,
+            s.id              AS scene_id,
+            lv.id             AS lecture_id,
+            lv.title          AS lecture_title,
+            ch.title          AS chapter_title,
+            co.name           AS course_name,
+            s.timestamp_start,
+            s.timestamp_end,
+            s.transcript,
+            s.ocr_text,
+            s.keyframe_minio_key,
             ts_rank(
                 setweight(COALESCE(s.transcript_fts, to_tsvector('')), 'A')
              || setweight(COALESCE(s.ocr_fts,        to_tsvector('')), 'B'),
                 plainto_tsquery('simple', :q)
-            )              AS kw_score,
-            ROW_NUMBER() OVER (
-                ORDER BY ts_rank(
-                    setweight(COALESCE(s.transcript_fts, to_tsvector('')), 'A')
-                 || setweight(COALESCE(s.ocr_fts,        to_tsvector('')), 'B'),
-                    plainto_tsquery('simple', :q)
-                ) DESC
-            ) AS rnk
+            ) AS score
+        FROM scenes s
+        JOIN lecture_videos lv ON lv.id = s.lecture_id
+        JOIN chapters ch        ON ch.id = lv.chapter_id
+        JOIN courses co          ON co.id = ch.course_id
+        WHERE (s.transcript_fts @@ plainto_tsquery('simple', :q)
+            OR s.ocr_fts        @@ plainto_tsquery('simple', :q))
+          AND lv.status = 'COMPLETED'
+          {course_filter}
+        ORDER BY score DESC
+        LIMIT :limit OFFSET :offset
+    """)
+    params: dict[str, Any] = {"q": q, "limit": limit, "offset": offset}
+    if course_id:
+        params["course_id"] = course_id
+
+    rows = (await db.execute(sql, params)).fetchall()
+    return [
+        SearchResult(
+            scene_id=str(row.scene_id),
+            lecture_id=str(row.lecture_id),
+            lecture_title=row.lecture_title,
+            chapter_title=row.chapter_title,
+            course_name=row.course_name,
+            timestamp_start=float(row.timestamp_start),
+            timestamp_end=float(row.timestamp_end),
+            transcript=row.transcript,
+            ocr_text=row.ocr_text,
+            keyframe_url=_keyframe_url(row.keyframe_minio_key),
+            score=float(row.score),
+        )
+        for row in rows
+    ]
+
+
+# ── Hybrid 3-arm RRF search → flatten to scene-level results ──────────────────
+
+async def _hybrid_search(
+    db: AsyncSession, q: str, course_id: Any, limit: int, offset: int
+) -> list[SearchResult]:
+    text_vec = _encode_e5(q)
+    clip_vec = _encode_clip(q)
+
+    course_filter = "AND co.id = :course_id" if course_id else ""
+    candidate_k = max(limit * 10, 100)
+
+    sql = text(f"""
+    WITH
+    kw AS (
+        SELECT s.id AS scene_id, s.lecture_id,
+            ts_rank(
+                setweight(COALESCE(s.transcript_fts, to_tsvector('')), 'A')
+             || setweight(COALESCE(s.ocr_fts, to_tsvector('')), 'B'),
+                plainto_tsquery('simple', :q)
+            ) AS kw_score,
+            ROW_NUMBER() OVER (ORDER BY ts_rank(
+                setweight(COALESCE(s.transcript_fts, to_tsvector('')), 'A')
+             || setweight(COALESCE(s.ocr_fts, to_tsvector('')), 'B'),
+                plainto_tsquery('simple', :q)
+            ) DESC) AS rnk
         FROM scenes s
         JOIN lecture_videos lv ON lv.id = s.lecture_id
         JOIN chapters ch        ON ch.id = lv.chapter_id
@@ -119,15 +165,10 @@ async def search(
           {course_filter}
         LIMIT :k
     ),
-    -- ── Arm 2: Text semantic — e5-large on scene text_embedding ────────────
     txt AS (
-        SELECT
-            s.id          AS scene_id,
-            s.lecture_id,
-            1 - (se.text_embedding <=> :text_vec::vector)  AS text_score,
-            ROW_NUMBER() OVER (
-                ORDER BY se.text_embedding <=> :text_vec::vector
-            ) AS rnk
+        SELECT s.id AS scene_id, s.lecture_id,
+            1 - (se.text_embedding <=> :text_vec::vector) AS text_score,
+            ROW_NUMBER() OVER (ORDER BY se.text_embedding <=> :text_vec::vector) AS rnk
         FROM scene_embeddings se
         JOIN scenes s           ON s.id  = se.scene_id
         JOIN lecture_videos lv  ON lv.id = s.lecture_id
@@ -139,15 +180,10 @@ async def search(
         ORDER BY se.text_embedding <=> :text_vec::vector
         LIMIT :k
     ),
-    -- ── Arm 3: Visual semantic — CLIP text→image_embedding ────────────────
     vis AS (
-        SELECT
-            s.id          AS scene_id,
-            s.lecture_id,
+        SELECT s.id AS scene_id, s.lecture_id,
             1 - (se.image_embedding <=> :clip_vec::vector) AS visual_score,
-            ROW_NUMBER() OVER (
-                ORDER BY se.image_embedding <=> :clip_vec::vector
-            ) AS rnk
+            ROW_NUMBER() OVER (ORDER BY se.image_embedding <=> :clip_vec::vector) AS rnk
         FROM scene_embeddings se
         JOIN scenes s           ON s.id  = se.scene_id
         JOIN lecture_videos lv  ON lv.id = s.lecture_id
@@ -159,182 +195,96 @@ async def search(
         ORDER BY se.image_embedding <=> :clip_vec::vector
         LIMIT :k
     ),
-    -- ── RRF fusion (weighted: text 1.2x, visual 0.6x) ─────────────────────
     rrf AS (
         SELECT
             COALESCE(kw.scene_id,   txt.scene_id,  vis.scene_id)   AS scene_id,
             COALESCE(kw.lecture_id, txt.lecture_id, vis.lecture_id) AS lecture_id,
-            COALESCE(kw.kw_score,     0)   AS kw_score,
-            COALESCE(txt.text_score,  0)   AS text_score,
-            COALESCE(vis.visual_score, 0)  AS visual_score,
             COALESCE(1.0 / (60 + kw.rnk),  0) * 1.0
           + COALESCE(1.0 / (60 + txt.rnk), 0) * 1.2
           + COALESCE(1.0 / (60 + vis.rnk), 0) * 0.6  AS rrf_score
         FROM kw
         FULL OUTER JOIN txt USING (scene_id)
         FULL OUTER JOIN vis USING (scene_id)
-    ),
-    -- ── Aggregate per video — boost videos with multiple matching scenes ───
-    video_agg AS (
-        SELECT
-            lecture_id,
-            COUNT(*)                                           AS matching_scenes,
-            MAX(rrf_score)                                     AS max_rrf,
-            -- boost: each additional matching scene adds ~30% weight
-            MAX(rrf_score) * (1 + 0.3 * LN(1 + COUNT(*)))    AS video_score,
-            (ARRAY_AGG(scene_id ORDER BY rrf_score DESC))[1]  AS best_scene_id,
-            ARRAY_AGG(scene_id ORDER BY rrf_score DESC)[1:3]  AS top_scene_ids
-        FROM rrf
-        GROUP BY lecture_id
-        ORDER BY video_score DESC
-        LIMIT :n_videos
+        ORDER BY rrf_score DESC
+        LIMIT :limit OFFSET :offset
     )
-    -- ── Final join ──────────────────────────────────────────────────────────
     SELECT
-        va.lecture_id,
-        va.video_score,
-        va.max_rrf,
-        va.matching_scenes,
-        va.top_scene_ids,
-        lv.title          AS lecture_title,
-        lv.duration_sec,
-        ch.title          AS chapter_title,
-        co.name           AS course_name,
-        -- best scene detail
-        s.id              AS best_scene_id,
-        s.timestamp_start AS best_ts_start,
-        s.timestamp_end   AS best_ts_end,
-        s.transcript      AS best_transcript,
-        s.ocr_text        AS best_ocr,
-        s.keyframe_minio_key AS best_keyframe,
-        r.kw_score        AS best_kw_score,
-        r.text_score      AS best_text_score,
-        r.visual_score    AS best_visual_score,
-        r.rrf_score       AS best_rrf_score
-    FROM video_agg va
-    JOIN lecture_videos lv  ON lv.id  = va.lecture_id
-    JOIN chapters ch        ON ch.id  = lv.chapter_id
-    JOIN courses co         ON co.id  = ch.course_id
-    JOIN scenes s           ON s.id   = va.best_scene_id
-    JOIN rrf r              ON r.scene_id = va.best_scene_id
-    ORDER BY va.video_score DESC
+        r.scene_id,
+        r.rrf_score            AS score,
+        lv.id                  AS lecture_id,
+        lv.title               AS lecture_title,
+        ch.title               AS chapter_title,
+        co.name                AS course_name,
+        s.timestamp_start,
+        s.timestamp_end,
+        s.transcript,
+        s.ocr_text,
+        s.keyframe_minio_key
+    FROM rrf r
+    JOIN scenes s           ON s.id  = r.scene_id
+    JOIN lecture_videos lv  ON lv.id = r.lecture_id
+    JOIN chapters ch        ON ch.id = lv.chapter_id
+    JOIN courses co         ON co.id = ch.course_id
+    ORDER BY r.rrf_score DESC
     """)
 
+    params: dict[str, Any] = {
+        "q": q,
+        "text_vec": text_vec,
+        "clip_vec": clip_vec,
+        "k": candidate_k,
+        "limit": limit,
+        "offset": offset,
+    }
+    if course_id:
+        params["course_id"] = course_id
+
     rows = (await db.execute(sql, params)).fetchall()
-
-    if not rows:
-        return SearchResponse(results=[], total_videos=0, query=request.q)
-
-    # ── Fetch top_scenes detail ────────────────────────────────────────────────
-    all_scene_ids: list[str] = []
-    for row in rows:
-        all_scene_ids.extend([str(sid) for sid in (row.top_scene_ids or [])])
-
-    scene_details: dict[str, Any] = {}
-    if all_scene_ids:
-        scene_sql = text("""
-            SELECT s.id, s.timestamp_start, s.timestamp_end,
-                   s.transcript, s.ocr_text, s.keyframe_minio_key,
-                   COALESCE(r.kw_score, 0)     AS kw_score,
-                   COALESCE(r.text_score, 0)   AS text_score,
-                   COALESCE(r.visual_score, 0) AS visual_score,
-                   COALESCE(r.rrf_score, 0)    AS rrf_score
-            FROM scenes s
-            LEFT JOIN (
-                SELECT
-                    COALESCE(kw2.scene_id, txt2.scene_id, vis2.scene_id) AS scene_id,
-                    COALESCE(kw2.kw_score, 0)    AS kw_score,
-                    COALESCE(txt2.text_score, 0) AS text_score,
-                    COALESCE(vis2.visual_score, 0) AS visual_score,
-                    COALESCE(1.0/(60+kw2.rnk),0)*1.0
-                  + COALESCE(1.0/(60+txt2.rnk),0)*1.2
-                  + COALESCE(1.0/(60+vis2.rnk),0)*0.6 AS rrf_score
-                FROM (SELECT s2.id AS scene_id,
-                             ts_rank(s2.fts_vector, plainto_tsquery('simple', :q)) AS kw_score,
-                             ROW_NUMBER() OVER (ORDER BY ts_rank(s2.fts_vector,
-                                 plainto_tsquery('simple', :q)) DESC) AS rnk
-                      FROM scenes s2 WHERE s2.id = ANY(:sids::uuid[])) kw2
-                FULL OUTER JOIN
-                     (SELECT se2.scene_id,
-                             1-(se2.text_embedding <=> :text_vec::vector) AS text_score,
-                             ROW_NUMBER() OVER (ORDER BY se2.text_embedding <=> :text_vec::vector) AS rnk
-                      FROM scene_embeddings se2 WHERE se2.scene_id = ANY(:sids::uuid[])) txt2
-                     USING (scene_id)
-                FULL OUTER JOIN
-                     (SELECT se3.scene_id,
-                             1-(se3.image_embedding <=> :clip_vec::vector) AS visual_score,
-                             ROW_NUMBER() OVER (ORDER BY se3.image_embedding <=> :clip_vec::vector) AS rnk
-                      FROM scene_embeddings se3 WHERE se3.scene_id = ANY(:sids::uuid[])) vis2
-                     USING (scene_id)
-            ) r ON r.scene_id = s.id
-            WHERE s.id = ANY(:sids::uuid[])
-        """)
-        import uuid as _uuid
-        scene_rows = (await db.execute(scene_sql, {
-            "sids": [_uuid.UUID(sid) for sid in all_scene_ids],
-            "q": request.q,
-            "text_vec": text_vec,
-            "clip_vec": clip_vec,
-        })).fetchall()
-        for sr in scene_rows:
-            scene_details[str(sr.id)] = sr
-
-    # ── Build response ─────────────────────────────────────────────────────────
-    settings = get_settings()
-
-    def _keyframe_url(key: str | None) -> str | None:
-        if not key:
-            return None
-        return f"{settings.storage_base_url}/{settings.storage_bucket_frames}/{key}"
-
-    def _make_snippet(scene_id_str: str) -> SceneSnippet | None:
-        sd = scene_details.get(scene_id_str)
-        if sd is None:
-            return None
-        return SceneSnippet(
-            scene_id=sd.id,
-            timestamp_start=float(sd.timestamp_start),
-            timestamp_end=float(sd.timestamp_end),
-            transcript=sd.transcript,
-            ocr_text=sd.ocr_text,
-            keyframe_url=_keyframe_url(sd.keyframe_minio_key),
-            kw_score=float(sd.kw_score),
-            text_score=float(sd.text_score),
-            visual_score=float(sd.visual_score),
-            rrf_score=float(sd.rrf_score),
-        )
-
-    results: list[VideoSearchResult] = []
-    for row in rows:
-        best = SceneSnippet(
-            scene_id=row.best_scene_id,
-            timestamp_start=float(row.best_ts_start),
-            timestamp_end=float(row.best_ts_end),
-            transcript=row.best_transcript,
-            ocr_text=row.best_ocr,
-            keyframe_url=_keyframe_url(row.best_keyframe),
-            kw_score=float(row.best_kw_score),
-            text_score=float(row.best_text_score),
-            visual_score=float(row.best_visual_score),
-            rrf_score=float(row.best_rrf_score),
-        )
-
-        top_scenes: list[SceneSnippet] = []
-        for sid in (row.top_scene_ids or []):
-            snippet = _make_snippet(str(sid))
-            if snippet:
-                top_scenes.append(snippet)
-
-        results.append(VideoSearchResult(
-            lecture_id=row.lecture_id,
+    return [
+        SearchResult(
+            scene_id=str(row.scene_id),
+            lecture_id=str(row.lecture_id),
             lecture_title=row.lecture_title,
             chapter_title=row.chapter_title,
             course_name=row.course_name,
-            duration_sec=row.duration_sec,
-            video_score=float(row.video_score),
-            matching_scene_count=int(row.matching_scenes),
-            best_scene=best,
-            top_scenes=top_scenes,
-        ))
+            timestamp_start=float(row.timestamp_start),
+            timestamp_end=float(row.timestamp_end),
+            transcript=row.transcript,
+            ocr_text=row.ocr_text,
+            keyframe_url=_keyframe_url(row.keyframe_minio_key),
+            score=float(row.score),
+        )
+        for row in rows
+    ]
 
-    return SearchResponse(results=results, total_videos=len(results), query=request.q)
+
+# ── Endpoint ──────────────────────────────────────────────────────────────────
+
+@router.get("/", response_model=SearchResponse)
+async def search(
+    q: str = Query(..., min_length=1),
+    mode: str = Query(default="keyword"),
+    course_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=10, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+) -> SearchResponse:
+    logger.info("search_requested", query=q, mode=mode, limit=limit, offset=offset)
+
+    results: list[SearchResult] = []
+
+    if mode == "semantic":
+        try:
+            results = await _hybrid_search(db, q, course_id, limit, offset)
+        except Exception as e:
+            logger.warning("hybrid_search_failed_fallback_keyword", error=str(e))
+            results = await _keyword_search(db, q, course_id, limit, offset)
+    else:
+        results = await _keyword_search(db, q, course_id, limit, offset)
+
+    return SearchResponse(
+        results=results,
+        total=len(results),
+        query=q,
+        mode=mode,
+    )

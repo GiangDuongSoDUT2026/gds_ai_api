@@ -400,7 +400,7 @@ class ChatSession(Base):
     __tablename__ = "chat_sessions"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(String(255))
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     course_id = Column(UUID(as_uuid=True), ForeignKey("courses.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
@@ -438,7 +438,8 @@ class ChatMessage(Base):
     duration_ms = Column(Integer, nullable=True)
     # Flexible JSONB — chứa agent_steps, citations, tool results
     # Schema: {"agent_steps": [...], "citations": [...]}
-    metadata = Column(JSONB, nullable=False, default=dict)
+    # Đặt tên msg_metadata vì 'metadata' là reserved name trong SQLAlchemy
+    msg_metadata = Column("metadata", JSONB, nullable=False, default=dict)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     session = relationship("ChatSession", back_populates="messages")

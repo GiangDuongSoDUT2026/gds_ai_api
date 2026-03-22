@@ -96,7 +96,8 @@ async def create_session(
     user_ctx: dict | None = Depends(get_user_context_from_header),
     db: AsyncSession = Depends(get_db),
 ) -> SessionResponse:
-    user_id = (user_ctx.get("user_id") if user_ctx else None) or data.user_id
+    raw_user_id = (user_ctx.get("user_id") if user_ctx else None) or data.user_id
+    user_id = uuid.UUID(raw_user_id) if raw_user_id else None
     session = ChatSession(
         id=uuid.uuid4(),
         user_id=user_id,
@@ -159,7 +160,7 @@ async def chat_with_history(
         sequence_num=next_seq + 1,
         status="DONE",
         duration_ms=duration_ms,
-        metadata=metadata,
+        msg_metadata=metadata,
     )
     db.add(assistant_msg)
     await db.commit()

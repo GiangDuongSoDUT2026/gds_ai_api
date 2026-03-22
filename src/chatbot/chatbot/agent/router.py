@@ -65,6 +65,7 @@ def _build_llm() -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.openai_model,
         api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url or None,
         temperature=0,
         streaming=True,
     )
@@ -134,7 +135,7 @@ class LectureAgent:
         return create_react_agent(
             self.llm,
             self.tools,
-            messages_modifier=SystemMessage(content=self.system_prompt),
+            prompt=SystemMessage(content=self.system_prompt),
         )
 
     def _build_messages(self, message: str, history: list[dict] | None) -> list[BaseMessage]:

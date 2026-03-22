@@ -32,7 +32,7 @@ class SessionCreate(BaseModel):
 
 class SessionResponse(BaseModel):
     id: UUID
-    user_id: str | None
+    user_id: UUID | None
     course_id: UUID | None
     created_at: datetime
 
